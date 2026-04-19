@@ -8,45 +8,49 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DATA_DIR     = 'prepared_data'
-MODEL_DIR    = 'models'
+DATA_DIR    = 'prepared_data'
+MODEL_DIR   = 'models'
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# LSTM hyperparameters
-INPUT_SIZE   = 64      # subcarriers per timestep
-HIDDEN_SIZE  = 128     # LSTM hidden units
-NUM_LAYERS   = 2       # stacked LSTM layers
-DROPOUT      = 0.3     # dropout between LSTM layers
-BIDIRECTIONAL = True   # BiLSTM — better for CSI patterns
+# Model hyperparameters
+INPUT_SIZE   = 64      # subcarriers
+CNN_CHANNELS = [32, 64, 128]   # conv layer output channels
+KERNEL_SIZE  = 3
+LSTM_HIDDEN  = 128
+LSTM_LAYERS  = 2
+ATTN_HEADS   = 4       # must divide LSTM_HIDDEN*2 evenly
+DROPOUT      = 0.3
 
-# Training hyperparameters
-BATCH_SIZE   = 64
-EPOCHS       = 120
+# Training
+BATCH_SIZE   = 32
+EPOCHS       = 100
 LR           = 1e-3
-PATIENCE     = 8       # early stopping patience
+PATIENCE     = 10
 
 # ── Device ────────────────────────────────────────────────────────────────────
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"[DEVICE] Using: {device}")
+print(f"[DEVICE] {device}")
 if device.type == 'cuda':
-    print(f"         GPU  : {torch.cuda.get_device_name(0)}\n")
+    print(f"         {torch.cuda.get_device_name(0)}\n")
 
 # ── Load data ─────────────────────────────────────────────────────────────────
-print("[1/4] Loading prepared data...")
-X_train  = np.load(os.path.join(DATA_DIR, 'X_train.npy'))
-X_val    = np.load(os.path.join(DATA_DIR, 'X_val.npy'))
-y_train  = np.load(os.path.join(DATA_DIR, 'y_train.npy'))
-y_val    = np.load(os.path.join(DATA_DIR, 'y_val.npy'))
-classes  = np.load(os.path.join(DATA_DIR, 'classes.npy'))
-
+print("[1/4] Loading data...")
+X_train = np.load(os.path.join(DATA_DIR, 'X_train.npy'))
+X_val   = np.load(os.path.join(DATA_DIR, 'X_val.npy'))
+y_train = np.load(os.path.join(DATA_DIR, 'y_train.npy'))
+y_val   = np.load(os.path.join(DATA_DIR, 'y_val.npy'))
+classes = np.load(os.path.join(DATA_DIR, 'classes.npy'))
 NUM_CLASSES = len(classes)
-print(f"  Classes    : {list(classes)}")
-print(f"  Train      : {X_train.shape}")
-print(f"  Val        : {X_val.shape}\n")
+
+print(f"  Classes : {list(classes)}")
+print(f"  Train   : {X_train.shape}")
+print(f"  Val     : {X_val.shape}\n")
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
 class CSIDataset(Dataset):
     def __init__(self, X, y):
+        # CNN expects (batch, channels, timesteps, features)
+        # We treat subcarriers as features, add channel dim
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.long)
 
@@ -64,167 +68,255 @@ val_loader   = DataLoader(CSIDataset(X_val, y_val),
                           pin_memory=(device.type == 'cuda'))
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-class PostureLSTM(nn.Module):
+
+class ChannelAttention(nn.Module):
+    """Squeeze-and-Excitation style attention over CNN channels."""
+    def __init__(self, channels, reduction=8):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.fc   = nn.Sequential(
+            nn.Linear(channels, channels // reduction),
+            nn.ReLU(),
+            nn.Linear(channels // reduction, channels),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # x: (batch, channels, time)
+        w = self.pool(x).squeeze(-1)   # (batch, channels)
+        w = self.fc(w).unsqueeze(-1)   # (batch, channels, 1)
+        return x * w                   # scale channels
+
+
+class TemporalAttention(nn.Module):
+    """Multi-head self-attention over LSTM timesteps."""
+    def __init__(self, hidden_size, num_heads):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim   = hidden_size,
+            num_heads   = num_heads,
+            dropout     = 0.1,
+            batch_first = True
+        )
+        self.norm = nn.LayerNorm(hidden_size)
+
+    def forward(self, x):
+        # x: (batch, timesteps, hidden)
+        attn_out, attn_weights = self.attn(x, x, x)
+        out = self.norm(x + attn_out)   # residual connection
+        return out, attn_weights
+
+
+class CNNBlock(nn.Module):
+    """1D CNN block: Conv → BN → ReLU → ChannelAttention → Dropout"""
+    def __init__(self, in_ch, out_ch, kernel=3):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(in_ch, out_ch, kernel_size=kernel,
+                      padding=kernel // 2),
+            nn.BatchNorm1d(out_ch),
+            nn.ReLU(),
+        )
+        self.ca      = ChannelAttention(out_ch)
+        self.dropout = nn.Dropout(0.2)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.ca(x)
+        return self.dropout(x)
+
+
+class CNNLSTMAttention(nn.Module):
     def __init__(self):
         super().__init__()
 
+        # ── CNN feature extractor ──────────────────────────────────────────
+        # Input: (batch, timesteps, 64)
+        # Permute to (batch, 64, timesteps) for Conv1d
+        cnn_layers = []
+        in_ch = INPUT_SIZE
+        for out_ch in CNN_CHANNELS:
+            cnn_layers.append(CNNBlock(in_ch, out_ch, KERNEL_SIZE))
+            in_ch = out_ch
+        self.cnn = nn.Sequential(*cnn_layers)
+        # Output: (batch, 128, timesteps)
+
+        # ── BiLSTM ────────────────────────────────────────────────────────
         self.lstm = nn.LSTM(
-            input_size   = INPUT_SIZE,
-            hidden_size  = HIDDEN_SIZE,
-            num_layers   = NUM_LAYERS,
+            input_size   = CNN_CHANNELS[-1],   # 128
+            hidden_size  = LSTM_HIDDEN,         # 128
+            num_layers   = LSTM_LAYERS,
             batch_first  = True,
             dropout      = DROPOUT,
-            bidirectional= BIDIRECTIONAL
+            bidirectional= True
         )
+        lstm_out = LSTM_HIDDEN * 2   # 256 (bidirectional)
 
-        lstm_out_size = HIDDEN_SIZE * (2 if BIDIRECTIONAL else 1)
+        # ── Temporal Attention ────────────────────────────────────────────
+        self.attn = TemporalAttention(lstm_out, ATTN_HEADS)
 
+        # ── Classifier ────────────────────────────────────────────────────
         self.classifier = nn.Sequential(
-            nn.LayerNorm(lstm_out_size),
-            nn.Linear(lstm_out_size, 64),
+            nn.Linear(lstm_out, 128),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(DROPOUT),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(DROPOUT),
             nn.Linear(64, NUM_CLASSES)
         )
 
     def forward(self, x):
-        # x: (batch, timesteps, features)
-        out, _ = self.lstm(x)
-        out     = out[:, -1, :]      # take last timestep
-        return self.classifier(out)
+        # x: (batch, timesteps=100, features=64)
 
-model = PostureLSTM().to(device)
-print("[2/4] Model architecture:")
+        # CNN: needs (batch, features, timesteps)
+        x = x.permute(0, 2, 1)          # → (batch, 64, 100)
+        x = self.cnn(x)                  # → (batch, 128, 100)
+        x = x.permute(0, 2, 1)          # → (batch, 100, 128)
+
+        # BiLSTM
+        x, _ = self.lstm(x)              # → (batch, 100, 256)
+
+        # Temporal Attention
+        x, attn_weights = self.attn(x)  # → (batch, 100, 256)
+
+        # Global average pool over timesteps
+        x = x.mean(dim=1)               # → (batch, 256)
+
+        return self.classifier(x)        # → (batch, num_classes)
+
+
+# ── Init model ────────────────────────────────────────────────────────────────
+model = CNNLSTMAttention().to(device)
+print("[2/4] Model:")
 print(model)
-total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print(f"\n  Trainable params: {total_params:,}\n")
+total = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"\n  Trainable params: {total:,}\n")
 
 # ── Training setup ────────────────────────────────────────────────────────────
-criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-    optimizer, mode='min', factor=0.5, patience=3
+criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer, T_max=EPOCHS, eta_min=1e-5
 )
 
 # ── Training loop ─────────────────────────────────────────────────────────────
 print("[3/4] Training...\n")
 
-train_losses, val_losses     = [], []
-train_accs,   val_accs       = [], []
+train_losses, val_losses = [], []
+train_accs,   val_accs   = [], []
 best_val_loss  = float('inf')
 patience_count = 0
-best_model_path = os.path.join(MODEL_DIR, 'best_posture_lstm.pth')
+best_path      = os.path.join(MODEL_DIR, 'best_cnn_lstm_attn.pth')
 
 for epoch in range(1, EPOCHS + 1):
 
-    # ── Train ─────────────────────────────────────────────────────────────────
+    # Train
     model.train()
-    t_loss, t_correct, t_total = 0, 0, 0
-
-    for X_batch, y_batch in train_loader:
-        X_batch = X_batch.to(device, non_blocking=True)
-        y_batch = y_batch.to(device, non_blocking=True)
-
+    t_loss = t_correct = t_total = 0
+    for X_b, y_b in train_loader:
+        X_b, y_b = X_b.to(device, non_blocking=True), y_b.to(device, non_blocking=True)
         optimizer.zero_grad()
-        logits = model(X_batch)
-        loss   = criterion(logits, y_batch)
+        logits = model(X_b)
+        loss   = criterion(logits, y_b)
         loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        t_loss    += loss.item() * len(y_b)
+        t_correct += (logits.argmax(1) == y_b).sum().item()
+        t_total   += len(y_b)
 
-        t_loss    += loss.item() * len(y_batch)
-        t_correct += (logits.argmax(1) == y_batch).sum().item()
-        t_total   += len(y_batch)
-
-    # ── Validate ──────────────────────────────────────────────────────────────
+    # Validate
     model.eval()
-    v_loss, v_correct, v_total = 0, 0, 0
-
+    v_loss = v_correct = v_total = 0
     with torch.no_grad():
-        for X_batch, y_batch in val_loader:
-            X_batch = X_batch.to(device, non_blocking=True)
-            y_batch = y_batch.to(device, non_blocking=True)
+        for X_b, y_b in val_loader:
+            X_b, y_b = X_b.to(device, non_blocking=True), y_b.to(device, non_blocking=True)
+            logits    = model(X_b)
+            loss      = criterion(logits, y_b)
+            v_loss    += loss.item() * len(y_b)
+            v_correct += (logits.argmax(1) == y_b).sum().item()
+            v_total   += len(y_b)
 
-            logits  = model(X_batch)
-            loss    = criterion(logits, y_batch)
+    t_l = t_loss / t_total
+    v_l = v_loss / v_total
+    t_a = t_correct / t_total * 100
+    v_a = v_correct / v_total * 100
 
-            v_loss    += loss.item() * len(y_batch)
-            v_correct += (logits.argmax(1) == y_batch).sum().item()
-            v_total   += len(y_batch)
+    train_losses.append(t_l)
+    val_losses.append(v_l)
+    train_accs.append(t_a)
+    val_accs.append(v_a)
 
-    # ── Stats ─────────────────────────────────────────────────────────────────
-    t_loss_avg = t_loss / t_total
-    v_loss_avg = v_loss / v_total
-    t_acc      = t_correct / t_total * 100
-    v_acc      = v_correct / v_total * 100
-
-    train_losses.append(t_loss_avg)
-    val_losses.append(v_loss_avg)
-    train_accs.append(t_acc)
-    val_accs.append(v_acc)
-
-    scheduler.step(v_loss_avg)
+    scheduler.step()
+    lr_now = optimizer.param_groups[0]['lr']
 
     print(f"Epoch [{epoch:>3}/{EPOCHS}]  "
-          f"Train Loss: {t_loss_avg:.4f}  Acc: {t_acc:.1f}%  |  "
-          f"Val Loss: {v_loss_avg:.4f}  Acc: {v_acc:.1f}%")
+          f"Train: {t_l:.4f} / {t_a:.1f}%  |  "
+          f"Val: {v_l:.4f} / {v_a:.1f}%  |  "
+          f"LR: {lr_now:.6f}")
 
-    # ── Early stopping + save best ────────────────────────────────────────────
-    if v_loss_avg < best_val_loss:
-        best_val_loss = v_loss_avg
+    if v_l < best_val_loss:
+        best_val_loss  = v_l
         patience_count = 0
         torch.save({
             'epoch'      : epoch,
             'model_state': model.state_dict(),
             'optimizer'  : optimizer.state_dict(),
             'val_loss'   : best_val_loss,
-            'val_acc'    : v_acc,
+            'val_acc'    : v_a,
             'classes'    : classes,
-        }, best_model_path)
-        print(f"  ✓ Best model saved (val_loss={best_val_loss:.4f})")
+            'config': {
+                'input_size'   : INPUT_SIZE,
+                'cnn_channels' : CNN_CHANNELS,
+                'kernel_size'  : KERNEL_SIZE,
+                'lstm_hidden'  : LSTM_HIDDEN,
+                'lstm_layers'  : LSTM_LAYERS,
+                'attn_heads'   : ATTN_HEADS,
+                'dropout'      : DROPOUT,
+                'num_classes'  : NUM_CLASSES,
+            }
+        }, best_path)
+        print(f"  ✓ Saved best model (val_loss={best_val_loss:.4f})")
     else:
         patience_count += 1
         if patience_count >= PATIENCE:
             print(f"\n[EARLY STOP] No improvement for {PATIENCE} epochs.")
             break
 
-# ── Final evaluation ──────────────────────────────────────────────────────────
-print("\n[4/4] Final Evaluation on Validation Set...")
-
-checkpoint = torch.load(best_model_path, weights_only=False)
-model.load_state_dict(checkpoint['model_state'])
+# ── Evaluate ──────────────────────────────────────────────────────────────────
+print("\n[4/4] Final Evaluation...")
+ckpt = torch.load(best_path, weights_only=False)
+model.load_state_dict(ckpt['model_state'])
 model.eval()
 
-all_preds, all_labels = [], []
+preds, labels = [], []
 with torch.no_grad():
-    for X_batch, y_batch in val_loader:
-        logits = model(X_batch.to(device))
-        preds  = logits.argmax(1).cpu().numpy()
-        all_preds.extend(preds)
-        all_labels.extend(y_batch.numpy())
+    for X_b, y_b in val_loader:
+        out = model(X_b.to(device)).argmax(1).cpu().numpy()
+        preds.extend(out)
+        labels.extend(y_b.numpy())
 
 print("\nClassification Report:")
-print(classification_report(all_labels, all_preds, target_names=classes))
+print(classification_report(labels, preds, target_names=classes))
 
 # ── Plots ─────────────────────────────────────────────────────────────────────
 fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+fig.suptitle('CNN-LSTM + Attention Training Results', fontsize=14)
 
-# Loss curve
 axes[0].plot(train_losses, label='Train')
 axes[0].plot(val_losses,   label='Val')
 axes[0].set_title('Loss')
 axes[0].set_xlabel('Epoch')
 axes[0].legend()
 
-# Accuracy curve
 axes[1].plot(train_accs, label='Train')
 axes[1].plot(val_accs,   label='Val')
 axes[1].set_title('Accuracy (%)')
 axes[1].set_xlabel('Epoch')
 axes[1].legend()
 
-# Confusion matrix
-cm = confusion_matrix(all_labels, all_preds)
+cm = confusion_matrix(labels, preds)
 sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
             xticklabels=classes, yticklabels=classes, ax=axes[2])
 axes[2].set_title('Confusion Matrix')
@@ -232,9 +324,11 @@ axes[2].set_xlabel('Predicted')
 axes[2].set_ylabel('Actual')
 
 plt.tight_layout()
-plt.savefig(os.path.join(MODEL_DIR, 'training_results.png'), dpi=150)
+out_img = os.path.join(MODEL_DIR, 'cnn_lstm_results.png')
+plt.savefig(out_img, dpi=150)
 plt.show()
 
-print(f"\n[DONE] Best val accuracy : {checkpoint['val_acc']:.1f}%")
-print(f"[DONE] Model saved to    : {best_model_path}")
-print(f"[DONE] Plot saved to     : {os.path.join(MODEL_DIR, 'training_results.png')}")
+print(f"\n[DONE] Best val accuracy : {ckpt['val_acc']:.1f}%")
+print(f"[DONE] Model saved       : {best_path}")
+print(f"[DONE] Plot saved        : {out_img}")
+print("\nNext → run predict_realtime.py")
