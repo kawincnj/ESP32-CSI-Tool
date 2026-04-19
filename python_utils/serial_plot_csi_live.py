@@ -7,7 +7,7 @@ from wait_timer import WaitTimer
 from read_stdin import readline, print_until_first_csi_line
 
 # Set subcarrier to plot
-subcarrier = 44
+subcarrier = 20
 
 # Wait Timers. Change these values to increase or decrease the rate of `print_stats` and `render_plot`.
 print_stats_wait_timer = WaitTimer(1.0)
@@ -31,48 +31,60 @@ plt.show(block=False)
 
 def carrier_plot(amp):
     plt.clf()
-    df = np.asarray(amp, dtype=np.int32)
-    # Can be changed to df[x] to plot sub-carrier x only (set color='r' also)
-    plt.plot(range(100 - len(amp), 100), df[:, subcarrier], color='r')
+    df = np.asarray(amp, dtype=object)
+    
+    # Find shortest row to avoid index errors
+    min_len = min(len(row) for row in amp)
+    if subcarrier >= min_len:
+        print(f"Subcarrier {subcarrier} out of range (max {min_len-1})")
+        return
+
+    df_vals = [row[subcarrier] for row in amp]
+    plt.plot(range(100 - len(amp), 100), df_vals, color='r')
     plt.xlabel("Time")
     plt.ylabel("Amplitude")
     plt.xlim(0, 100)
     plt.title(f"Amplitude plot of Subcarrier {subcarrier}")
-    # TODO use blit instead of flush_events for more fastness
-    # to flush the GUI events
     fig.canvas.flush_events()
     plt.show()
 
 
 def process(res):
-    # Parser
+    # Split CSV fields
     all_data = res.split(',')
-    csi_data = all_data[25].split(" ")
-    csi_data[0] = csi_data[0].replace("[", "")
-    csi_data[-1] = csi_data[-1].replace("]", "")
 
-    csi_data.pop()
-    csi_data = [int(c) for c in csi_data if c]
-    imaginary = []
-    real = []
-    for i, val in enumerate(csi_data):
-        if i % 2 == 0:
-            imaginary.append(val)
-        else:
-            real.append(val)
+    # Find the field that starts with '[' (CSI buffer)
+    csi_raw = None
+    for field in all_data:
+        if '[' in field:
+            csi_raw = field
+            break
 
-    csi_size = len(csi_data)
+    if csi_raw is None:
+        return
+
+    # Strip brackets and split by whitespace (space-separated)
+    csi_raw = csi_raw.replace('[', '').replace(']', '').strip()
+    csi_data = [int(x) for x in csi_raw.split() if x]
+
+    if len(csi_data) < 2:
+        return
+
+    # Split into imaginary and real (alternating: imag, real, imag, real...)
+    imaginary = csi_data[0::2]
+    real      = csi_data[1::2]
+
     amplitudes = []
     phases = []
-    if len(imaginary) > 0 and len(real) > 0:
-        for j in range(int(csi_size / 2)):
-            amplitude_calc = math.sqrt(imaginary[j] ** 2 + real[j] ** 2)
-            phase_calc = math.atan2(imaginary[j], real[j])
-            amplitudes.append(amplitude_calc)
-            phases.append(phase_calc)
+    for i in range(min(len(imaginary), len(real))):
+        amp   = math.sqrt(imaginary[i] ** 2 + real[i] ** 2)
+        phase = math.atan2(imaginary[i], real[i])
+        amplitudes.append(amp)
+        phases.append(phase)
 
-        perm_phase.append(phases)
+    if amplitudes:
         perm_amp.append(amplitudes)
+        perm_phase.append(phases)
 
 print_until_first_csi_line()
 
