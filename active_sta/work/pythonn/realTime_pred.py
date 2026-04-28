@@ -6,13 +6,19 @@ import collections
 import numpy as np
 import torch
 import torch.nn as nn
+import os
 from datetime import datetime
 
 # ── Config ────────────────────────────────────────────────────────────────────
-PORT        = 'COM7'
+PORT        = '/dev/ttyUSB0'
 BAUDRATE    = 921600
-MODEL_PATH  = 'models/best_cnn_lstm_attn.pth'
-DATA_DIR    = 'prepared_data'
+
+# Get the project root directory (2 levels up from this script)
+SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
+
+MODEL_PATH  = os.path.join(PROJECT_ROOT, 'models/best_cnn_lstm_attn.pth')
+DATA_DIR    = os.path.join(PROJECT_ROOT, 'prepared_data')
 WINDOW_SIZE = 100
 MIN_CSI_LEN = 64
 CONFIRM_N   = 3

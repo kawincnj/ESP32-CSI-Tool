@@ -8,8 +8,12 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DATA_DIR    = 'prepared_data'
-MODEL_DIR   = 'models'
+# Get the project root directory (2 levels up from this script)
+SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
+
+DATA_DIR    = os.path.join(PROJECT_ROOT, 'prepared_data')
+MODEL_DIR   = os.path.join(PROJECT_ROOT, 'models')
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 # Model hyperparameters

@@ -5,8 +5,12 @@ import pandas as pd
 from sklearn.preprocessing import LabelEncoder
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DATASET_DIR  = 'csi_dataset'
-OUTPUT_DIR   = 'prepared_data'
+# Get the project root directory (2 levels up from this script)
+SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
+
+DATASET_DIR  = os.path.join(PROJECT_ROOT, 'csi_dataset')
+OUTPUT_DIR   = os.path.join(PROJECT_ROOT, 'prepared_data')
 WINDOW_SIZE  = 100      # timesteps per sequence
 STRIDE       = 100      # no overlap = no leakage
 MIN_CSI_LEN  = 64

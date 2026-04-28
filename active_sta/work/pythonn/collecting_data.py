@@ -7,9 +7,14 @@ import math
 from datetime import datetime
 
 # ── Config ────────────────────────────────────────────────────────────────────
-PORT       = 'COM7'
+PORT       = '/dev/ttyUSB0'
 BAUDRATE   = 921600
-SAVE_DIR   = 'csi_dataset'
+
+# Get the project root directory (2 levels up from this script)
+SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
+
+SAVE_DIR   = os.path.join(PROJECT_ROOT, 'csi_dataset')
 
 # ↓↓ CHANGE THESE BEFORE EACH SESSION ↓↓
 LABEL      = 'standing'   # sitting / standing / walking / bending / lying
